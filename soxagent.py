@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-SOXAgent - Automated SOXL dip-buying agent using the Schwab Trader API.
+SOXAgent - Automated SOXL trading agent using the Schwab Trader API.
 
-Checks SOXL price every 15 minutes. If SOXL is down 10%+ from today's open,
-no trades have been placed today, and there is at least $250 cash in the
-account, it buys $200 worth of SOXL.
+Checks SOXL price every 15 minutes.
+- Buys $200 if down 10%+ from open, no buys today, $250+ cash, under $400/wk.
+- Sells $200 if up 10%+ from open, no sells today, under 2 sells/wk.
 """
 
 import argparse
@@ -17,13 +17,16 @@ import time
 from datetime import datetime, date, timedelta
 
 import schwab
-from schwab.orders.equities import equity_buy_market
+from schwab.orders.equities import equity_buy_market, equity_sell_market
 
 SYMBOL = "SOXL"
 DIP_THRESHOLD = -0.10  # -10%
+SURGE_THRESHOLD = 0.10  # +10%
 MIN_CASH = 250.0
 BUY_AMOUNT = 200.0
+SELL_AMOUNT = 200.0
 WEEKLY_BUY_LIMIT = 400.0
+WEEKLY_SELL_LIMIT = 2  # max sell orders per week
 CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".soxagent.lock")
 
@@ -122,8 +125,8 @@ def get_quote(client, symbol):
     return last, open_price, pct_change
 
 
-def has_orders_today(client, account_hash):
-    """Check if any orders were placed today."""
+def has_orders_today(client, account_hash, symbol, instruction):
+    """Check if any orders with the given instruction (BUY/SELL) were placed today for symbol."""
     today = datetime.now()
     start = today.replace(hour=0, minute=0, second=0, microsecond=0)
     resp = client.get_orders_for_account(
@@ -132,8 +135,12 @@ def has_orders_today(client, account_hash):
         to_entered_datetime=today,
     )
     resp.raise_for_status()
-    orders = resp.json()
-    return len(orders) > 0
+    for order in resp.json():
+        for leg in order.get("orderLegCollection", []):
+            if (leg.get("instrument", {}).get("symbol") == symbol
+                    and leg.get("instruction") == instruction):
+                return True
+    return False
 
 
 def get_weekly_spend(client, account_hash, symbol):
@@ -165,6 +172,40 @@ def get_weekly_spend(client, account_hash, symbol):
     return total
 
 
+def get_weekly_sell_count(client, account_hash, symbol):
+    """Return number of sell orders for symbol in the past 7 days."""
+    now = datetime.now()
+    week_ago = now - timedelta(days=7)
+    resp = client.get_orders_for_account(
+        account_hash,
+        from_entered_datetime=week_ago,
+        to_entered_datetime=now,
+    )
+    resp.raise_for_status()
+    count = 0
+    for order in resp.json():
+        for leg in order.get("orderLegCollection", []):
+            if (leg.get("instrument", {}).get("symbol") == symbol
+                    and leg.get("instruction") == "SELL"):
+                count += 1
+    return count
+
+
+def place_sell_order(client, account_hash, symbol, dollar_amount, current_price):
+    """Place a market sell order for the given dollar amount of shares."""
+    shares = math.floor(dollar_amount / current_price)
+    if shares < 1:
+        print(f"[order] Price ${current_price:.2f} too high to sell even 1 share for ${dollar_amount:.2f}.")
+        return False
+
+    order = equity_sell_market(symbol, shares)
+    print(f"[order] Placing market SELL for {shares} shares of {symbol} (~${shares * current_price:.2f})...")
+    resp = client.place_order(account_hash, order)
+    resp.raise_for_status()
+    print(f"[order] Order placed successfully. Status: {resp.status_code}")
+    return True
+
+
 def place_buy_order(client, account_hash, symbol, dollar_amount, current_price):
     """Place a market buy order for the given dollar amount of shares."""
     shares = math.floor(dollar_amount / current_price)
@@ -181,7 +222,7 @@ def place_buy_order(client, account_hash, symbol, dollar_amount, current_price):
 
 
 def check_and_trade(client, account_hash):
-    """Run one check cycle: get quote, evaluate conditions, maybe trade."""
+    """Run one check cycle: get quote, evaluate conditions, maybe buy or sell."""
     now = datetime.now()
     print(f"\n[{now.strftime('%H:%M:%S')}] Checking {SYMBOL}...")
 
@@ -189,27 +230,30 @@ def check_and_trade(client, account_hash):
     last, open_price, pct_change = get_quote(client, SYMBOL)
     print(f"  Open: ${open_price:.2f}  Last: ${last:.2f}  Change: {pct_change:+.2%}")
 
-    if pct_change > DIP_THRESHOLD:
-        print(f"  Not down enough (threshold: {DIP_THRESHOLD:.0%}). Skipping.")
+    if pct_change <= DIP_THRESHOLD:
+        check_buy(client, account_hash, last, pct_change)
+    elif pct_change >= SURGE_THRESHOLD:
+        check_sell(client, account_hash, last, pct_change)
+    else:
+        print(f"  No action (buy threshold: {DIP_THRESHOLD:.0%}, sell threshold: +{SURGE_THRESHOLD:.0%}).")
+
+
+def check_buy(client, account_hash, last, pct_change):
+    """Evaluate buy conditions and place order if met."""
+    print(f"  Down {pct_change:+.2%} — meets {DIP_THRESHOLD:.0%} buy threshold!")
+
+    if has_orders_today(client, account_hash, SYMBOL, "BUY"):
+        print("  Already have a buy order today. Skipping.")
         return
 
-    print(f"  Down {pct_change:+.2%} — meets {DIP_THRESHOLD:.0%} threshold!")
-
-    # Check if we already traded today
-    if has_orders_today(client, account_hash):
-        print("  Already have orders today. Skipping.")
-        return
-
-    # Check weekly spend limit
     weekly_spend = get_weekly_spend(client, account_hash, SYMBOL)
     remaining = WEEKLY_BUY_LIMIT - weekly_spend
-    print(f"  Weekly spend: ${weekly_spend:.2f} / ${WEEKLY_BUY_LIMIT:.2f} (${remaining:.2f} remaining)")
+    print(f"  Weekly buy spend: ${weekly_spend:.2f} / ${WEEKLY_BUY_LIMIT:.2f} (${remaining:.2f} remaining)")
 
     if remaining < BUY_AMOUNT:
-        print(f"  Weekly limit would be exceeded. Skipping.")
+        print(f"  Weekly buy limit would be exceeded. Skipping.")
         return
 
-    # Check cash balance
     cash = get_cash_balance(client, account_hash)
     print(f"  Cash available: ${cash:.2f}")
 
@@ -217,8 +261,25 @@ def check_and_trade(client, account_hash):
         print(f"  Insufficient cash (need ${MIN_CASH:.2f}). Skipping.")
         return
 
-    # Place the buy
     place_buy_order(client, account_hash, SYMBOL, BUY_AMOUNT, last)
+
+
+def check_sell(client, account_hash, last, pct_change):
+    """Evaluate sell conditions and place order if met."""
+    print(f"  Up {pct_change:+.2%} — meets +{SURGE_THRESHOLD:.0%} sell threshold!")
+
+    if has_orders_today(client, account_hash, SYMBOL, "SELL"):
+        print("  Already have a sell order today. Skipping.")
+        return
+
+    weekly_sells = get_weekly_sell_count(client, account_hash, SYMBOL)
+    print(f"  Weekly sells: {weekly_sells} / {WEEKLY_SELL_LIMIT}")
+
+    if weekly_sells >= WEEKLY_SELL_LIMIT:
+        print(f"  Weekly sell limit reached. Skipping.")
+        return
+
+    place_sell_order(client, account_hash, SYMBOL, SELL_AMOUNT, last)
 
 
 def main():
@@ -244,8 +305,8 @@ def main():
         return
 
     print(f"[agent] Starting SOXL agent. Checking every {CHECK_INTERVAL_SECONDS // 60} minutes.")
-    print(f"[agent] Buy ${BUY_AMOUNT:.0f} of {SYMBOL} if down {DIP_THRESHOLD:.0%}, "
-          f"cash >= ${MIN_CASH:.0f}, no trades today.")
+    print(f"[agent] Buy ${BUY_AMOUNT:.0f} if down {DIP_THRESHOLD:.0%} (max ${WEEKLY_BUY_LIMIT:.0f}/wk), "
+          f"sell ${SELL_AMOUNT:.0f} if up +{SURGE_THRESHOLD:.0%} (max {WEEKLY_SELL_LIMIT}/wk).")
 
     while True:
         try:
