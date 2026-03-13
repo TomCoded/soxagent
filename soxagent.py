@@ -14,7 +14,7 @@ import math
 import os
 import sys
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 import schwab
 from schwab.orders.equities import equity_buy_market
@@ -23,6 +23,7 @@ SYMBOL = "SOXL"
 DIP_THRESHOLD = -0.10  # -10%
 MIN_CASH = 250.0
 BUY_AMOUNT = 200.0
+WEEKLY_BUY_LIMIT = 400.0
 CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".soxagent.lock")
 
@@ -135,6 +136,35 @@ def has_orders_today(client, account_hash):
     return len(orders) > 0
 
 
+def get_weekly_spend(client, account_hash, symbol):
+    """Return total dollar amount spent on buy orders for symbol in the past 7 days."""
+    now = datetime.now()
+    week_ago = now - timedelta(days=7)
+    resp = client.get_orders_for_account(
+        account_hash,
+        from_entered_datetime=week_ago,
+        to_entered_datetime=now,
+    )
+    resp.raise_for_status()
+    total = 0.0
+    for order in resp.json():
+        if order.get("orderLegCollection"):
+            for leg in order["orderLegCollection"]:
+                instrument = leg.get("instrument", {})
+                if (instrument.get("symbol") == symbol
+                        and leg.get("instruction") == "BUY"):
+                    # Use filled quantity * average price if available
+                    filled_qty = float(order.get("filledQuantity", 0))
+                    price = float(order.get("price", 0))
+                    if filled_qty and price:
+                        total += filled_qty * price
+                    else:
+                        # Fall back to requested quantity * last price from order
+                        qty = float(order.get("quantity", 0))
+                        total += qty * price
+    return total
+
+
 def place_buy_order(client, account_hash, symbol, dollar_amount, current_price):
     """Place a market buy order for the given dollar amount of shares."""
     shares = math.floor(dollar_amount / current_price)
@@ -168,6 +198,15 @@ def check_and_trade(client, account_hash):
     # Check if we already traded today
     if has_orders_today(client, account_hash):
         print("  Already have orders today. Skipping.")
+        return
+
+    # Check weekly spend limit
+    weekly_spend = get_weekly_spend(client, account_hash, SYMBOL)
+    remaining = WEEKLY_BUY_LIMIT - weekly_spend
+    print(f"  Weekly spend: ${weekly_spend:.2f} / ${WEEKLY_BUY_LIMIT:.2f} (${remaining:.2f} remaining)")
+
+    if remaining < BUY_AMOUNT:
+        print(f"  Weekly limit would be exceeded. Skipping.")
         return
 
     # Check cash balance
