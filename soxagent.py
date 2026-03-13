@@ -27,6 +27,7 @@ BUY_AMOUNT = 200.0
 SELL_AMOUNT = 200.0
 WEEKLY_BUY_LIMIT = 400.0
 WEEKLY_SELL_LIMIT = 2  # max sell orders per week
+LIMIT_ORDER_DRIFT = 0.01  # 1% buffer on limit prices to help fills
 CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".soxagent.lock")
 
@@ -205,12 +206,13 @@ def get_weekly_sell_count(client, account_hash, symbol):
 
 
 def place_sell_order(client, account_hash, symbol, shares, current_price, dry_run=False):
-    """Place a limit sell order."""
+    """Place a limit sell order with drift buffer below current price."""
+    limit_price = round(current_price * (1 - LIMIT_ORDER_DRIFT), 2)
     if dry_run:
-        print(f"[dry-run] Would SELL {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})")
+        print(f"[dry-run] Would SELL {shares} shares of {symbol} @ limit ${limit_price:.2f} (~${shares * limit_price:.2f})")
         return True
-    order = equity_sell_limit(symbol, shares, current_price)
-    print(f"[order] Placing limit SELL for {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})...")
+    order = equity_sell_limit(symbol, shares, limit_price)
+    print(f"[order] Placing limit SELL for {shares} shares of {symbol} @ limit ${limit_price:.2f} (~${shares * limit_price:.2f})...")
     resp = client.place_order(account_hash, order)
     resp.raise_for_status()
     print(f"[order] Order placed successfully. Status: {resp.status_code}")
@@ -218,12 +220,13 @@ def place_sell_order(client, account_hash, symbol, shares, current_price, dry_ru
 
 
 def place_buy_order(client, account_hash, symbol, shares, current_price, dry_run=False):
-    """Place a limit buy order."""
+    """Place a limit buy order with drift buffer above current price."""
+    limit_price = round(current_price * (1 + LIMIT_ORDER_DRIFT), 2)
     if dry_run:
-        print(f"[dry-run] Would BUY {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})")
+        print(f"[dry-run] Would BUY {shares} shares of {symbol} @ limit ${limit_price:.2f} (~${shares * limit_price:.2f})")
         return True
-    order = equity_buy_limit(symbol, shares, current_price)
-    print(f"[order] Placing limit BUY for {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})...")
+    order = equity_buy_limit(symbol, shares, limit_price)
+    print(f"[order] Placing limit BUY for {shares} shares of {symbol} @ limit ${limit_price:.2f} (~${shares * limit_price:.2f})...")
     resp = client.place_order(account_hash, order)
     resp.raise_for_status()
     print(f"[order] Order placed successfully. Status: {resp.status_code}")
