@@ -204,8 +204,11 @@ def get_weekly_sell_count(client, account_hash, symbol):
     return count
 
 
-def place_sell_order(client, account_hash, symbol, shares, current_price):
+def place_sell_order(client, account_hash, symbol, shares, current_price, dry_run=False):
     """Place a limit sell order."""
+    if dry_run:
+        print(f"[dry-run] Would SELL {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})")
+        return True
     order = equity_sell_limit(symbol, shares, current_price)
     print(f"[order] Placing limit SELL for {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})...")
     resp = client.place_order(account_hash, order)
@@ -214,8 +217,11 @@ def place_sell_order(client, account_hash, symbol, shares, current_price):
     return True
 
 
-def place_buy_order(client, account_hash, symbol, shares, current_price):
+def place_buy_order(client, account_hash, symbol, shares, current_price, dry_run=False):
     """Place a limit buy order."""
+    if dry_run:
+        print(f"[dry-run] Would BUY {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})")
+        return True
     order = equity_buy_limit(symbol, shares, current_price)
     print(f"[order] Placing limit BUY for {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})...")
     resp = client.place_order(account_hash, order)
@@ -224,24 +230,25 @@ def place_buy_order(client, account_hash, symbol, shares, current_price):
     return True
 
 
-def check_and_trade(client, account_hash):
+def check_and_trade(client, account_hash, dry_run=False):
     """Run one check cycle: get quote, evaluate conditions, maybe buy or sell."""
     now = datetime.now()
-    print(f"\n[{now.strftime('%H:%M:%S')}] Checking {SYMBOL}...")
+    prefix = "[dry-run] " if dry_run else ""
+    print(f"\n{prefix}[{now.strftime('%H:%M:%S')}] Checking {SYMBOL}...")
 
     # Get current quote
     last, open_price, pct_change = get_quote(client, SYMBOL)
     print(f"  Open: ${open_price:.2f}  Last: ${last:.2f}  Change: {pct_change:+.2%}")
 
     if pct_change <= DIP_THRESHOLD:
-        check_buy(client, account_hash, last, pct_change)
+        check_buy(client, account_hash, last, pct_change, dry_run)
     elif pct_change >= SURGE_THRESHOLD:
-        check_sell(client, account_hash, last, pct_change)
+        check_sell(client, account_hash, last, pct_change, dry_run)
     else:
         print(f"  No action (buy threshold: {DIP_THRESHOLD:.0%}, sell threshold: +{SURGE_THRESHOLD:.0%}).")
 
 
-def check_buy(client, account_hash, last, pct_change):
+def check_buy(client, account_hash, last, pct_change, dry_run=False):
     """Evaluate buy conditions and place order if met."""
     print(f"  Down {pct_change:+.2%} — meets {DIP_THRESHOLD:.0%} buy threshold!")
 
@@ -270,10 +277,10 @@ def check_buy(client, account_hash, last, pct_change):
         print(f"  Insufficient cash (need ${MIN_CASH:.2f}). Skipping.")
         return
 
-    place_buy_order(client, account_hash, SYMBOL, shares, last)
+    place_buy_order(client, account_hash, SYMBOL, shares, last, dry_run)
 
 
-def check_sell(client, account_hash, last, pct_change):
+def check_sell(client, account_hash, last, pct_change, dry_run=False):
     """Evaluate sell conditions and place order if met."""
     print(f"  Up {pct_change:+.2%} — meets +{SURGE_THRESHOLD:.0%} sell threshold!")
 
@@ -302,15 +309,107 @@ def check_sell(client, account_hash, last, pct_change):
         print(f"  No {SYMBOL} shares to sell. Skipping.")
         return
 
-    place_sell_order(client, account_hash, SYMBOL, shares_to_sell, last)
+    place_sell_order(client, account_hash, SYMBOL, shares_to_sell, last, dry_run)
+
+
+def backtest(client, days):
+    """Run strategy against historical daily OHLC data."""
+    end = datetime.now()
+    start = end - timedelta(days=days)
+
+    print(f"[backtest] Fetching {SYMBOL} price history for {days} days...")
+    resp = client.get_price_history_every_day(SYMBOL, start_datetime=start, end_datetime=end)
+    resp.raise_for_status()
+    candles = resp.json().get("candles", [])
+    if not candles:
+        print("[backtest] No historical data returned.")
+        return
+
+    cash = MIN_CASH
+    shares = 0
+    trades = []
+    weekly_buy_spend = 0.0
+    weekly_sell_count = 0
+    last_week_num = None
+
+    print(f"[backtest] Starting with ${cash:.2f} cash, 0 shares.")
+    print(f"[backtest] Simulating {len(candles)} trading days...\n")
+
+    for candle in candles:
+        dt = datetime.fromtimestamp(candle["datetime"] / 1000)
+        open_price = candle["open"]
+        low = candle["low"]
+        high = candle["high"]
+
+        # Reset weekly counters each new week
+        week_num = dt.isocalendar()[1]
+        if last_week_num is not None and week_num != last_week_num:
+            weekly_buy_spend = 0.0
+            weekly_sell_count = 0
+        last_week_num = week_num
+
+        # Check for buy: use low as worst-case intraday price
+        pct_low = (low - open_price) / open_price if open_price else 0.0
+        if pct_low <= DIP_THRESHOLD:
+            buy_price = open_price * (1 + DIP_THRESHOLD)  # approximate trigger price
+            buy_shares = math.floor(BUY_AMOUNT / buy_price)
+            if (buy_shares >= 1
+                    and cash >= MIN_CASH
+                    and weekly_buy_spend + BUY_AMOUNT <= WEEKLY_BUY_LIMIT):
+                cost = buy_shares * buy_price
+                cash -= cost
+                shares += buy_shares
+                weekly_buy_spend += cost
+                trades.append((dt.date(), "BUY", buy_shares, buy_price, cash, shares))
+                print(f"  {dt.date()}  BUY  {buy_shares} @ ${buy_price:.2f}  "
+                      f"cash=${cash:.2f}  shares={shares}")
+
+        # Check for sell: use high as best-case intraday price
+        pct_high = (high - open_price) / open_price if open_price else 0.0
+        if pct_high >= SURGE_THRESHOLD and shares > 0:
+            sell_price = open_price * (1 + SURGE_THRESHOLD)  # approximate trigger price
+            sell_shares = min(math.floor(SELL_AMOUNT / sell_price), shares)
+            if sell_shares >= 1 and weekly_sell_count < WEEKLY_SELL_LIMIT:
+                proceeds = sell_shares * sell_price
+                cash += proceeds
+                shares -= sell_shares
+                weekly_sell_count += 1
+                trades.append((dt.date(), "SELL", sell_shares, sell_price, cash, shares))
+                print(f"  {dt.date()}  SELL {sell_shares} @ ${sell_price:.2f}  "
+                      f"cash=${cash:.2f}  shares={shares}")
+
+    # Final summary
+    final_price = candles[-1]["close"]
+    portfolio_value = cash + shares * final_price
+    initial_value = MIN_CASH
+    total_return = (portfolio_value - initial_value) / initial_value
+
+    buys = [t for t in trades if t[1] == "BUY"]
+    sells = [t for t in trades if t[1] == "SELL"]
+
+    print(f"\n{'=' * 60}")
+    start_date = datetime.fromtimestamp(candles[0]["datetime"] / 1000).date()
+    end_date = datetime.fromtimestamp(candles[-1]["datetime"] / 1000).date()
+    print(f"  Backtest Results: {start_date} — {end_date}")
+    print(f"  {SYMBOL} final close: ${final_price:.2f}")
+    print(f"  Trades: {len(buys)} buys, {len(sells)} sells")
+    print(f"  Final cash:   ${cash:.2f}")
+    print(f"  Final shares: {shares} (worth ${shares * final_price:.2f})")
+    print(f"  Portfolio:    ${portfolio_value:.2f}")
+    print(f"  Total return: {total_return:+.2%}")
+    print(f"{'=' * 60}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SOXL dip-buying agent")
+    parser = argparse.ArgumentParser(description="SOXL trading agent")
     parser.add_argument("--show-accounts", action="store_true",
                         help="Show linked accounts and exit")
     parser.add_argument("--once", action="store_true",
                         help="Run one check cycle and exit (no loop)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run checks against live data but do not place orders")
+    parser.add_argument("--backtest", type=int, metavar="DAYS",
+                        help="Backtest strategy against N days of historical data")
     args = parser.parse_args()
 
     load_env()
@@ -321,10 +420,14 @@ def main():
         show_accounts(client)
         return
 
+    if args.backtest:
+        backtest(client, args.backtest)
+        return
+
     account_hash = get_account_hash(client)
 
-    if args.once:
-        check_and_trade(client, account_hash)
+    if args.once or args.dry_run:
+        check_and_trade(client, account_hash, dry_run=args.dry_run)
         return
 
     print(f"[agent] Starting SOXL agent. Checking every {CHECK_INTERVAL_SECONDS // 60} minutes.")
