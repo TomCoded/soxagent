@@ -1,4 +1,5 @@
 .env
+.soxagent.lock
 token.json
 __pycache__/
 *.pyc

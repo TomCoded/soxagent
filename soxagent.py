@@ -8,9 +8,11 @@ account, it buys $200 worth of SOXL.
 """
 
 import argparse
+import fcntl
 import json
 import math
 import os
+import sys
 import time
 from datetime import datetime, date
 
@@ -22,6 +24,18 @@ DIP_THRESHOLD = -0.10  # -10%
 MIN_CASH = 250.0
 BUY_AMOUNT = 200.0
 CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".soxagent.lock")
+
+
+def acquire_lock():
+    """Acquire a file lock to prevent multiple instances from running."""
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[error] Another instance of soxagent is already running.")
+        sys.exit(1)
+    return lock_fd
 
 
 def load_env():
@@ -177,6 +191,7 @@ def main():
     args = parser.parse_args()
 
     load_env()
+    lock_fd = acquire_lock()
     client = get_client()
 
     if args.show_accounts:
