@@ -17,7 +17,7 @@ import time
 from datetime import datetime, date, timedelta
 
 import schwab
-from schwab.orders.equities import equity_buy_market, equity_sell_market
+from schwab.orders.equities import equity_buy_limit, equity_sell_limit
 
 SYMBOL = "SOXL"
 DIP_THRESHOLD = -0.10  # -10%
@@ -103,14 +103,27 @@ def show_accounts(client):
         print(f"  Account: ...{acct['accountNumber'][-4:]}  Hash: {acct['hashValue']}")
 
 
-def get_cash_balance(client, account_hash):
-    """Return available cash in the account."""
-    resp = client.get_account(account_hash)
+def get_account_data(client, account_hash):
+    """Return the full account data dict."""
+    resp = client.get_account(account_hash, fields=[schwab.client.Client.Account.Fields.POSITIONS])
     resp.raise_for_status()
-    data = resp.json()
-    balances = data["securitiesAccount"]["currentBalances"]
+    return resp.json()
+
+
+def get_cash_balance(account_data):
+    """Return available cash from account data."""
+    balances = account_data["securitiesAccount"]["currentBalances"]
     cash = balances.get("cashBalance", balances.get("availableFunds", 0.0))
     return float(cash)
+
+
+def get_shares_held(account_data, symbol):
+    """Return number of shares held for a symbol."""
+    positions = account_data["securitiesAccount"].get("positions", [])
+    for pos in positions:
+        if pos.get("instrument", {}).get("symbol") == symbol:
+            return float(pos.get("longQuantity", 0))
+    return 0.0
 
 
 def get_quote(client, symbol):
@@ -191,30 +204,20 @@ def get_weekly_sell_count(client, account_hash, symbol):
     return count
 
 
-def place_sell_order(client, account_hash, symbol, dollar_amount, current_price):
-    """Place a market sell order for the given dollar amount of shares."""
-    shares = math.floor(dollar_amount / current_price)
-    if shares < 1:
-        print(f"[order] Price ${current_price:.2f} too high to sell even 1 share for ${dollar_amount:.2f}.")
-        return False
-
-    order = equity_sell_market(symbol, shares)
-    print(f"[order] Placing market SELL for {shares} shares of {symbol} (~${shares * current_price:.2f})...")
+def place_sell_order(client, account_hash, symbol, shares, current_price):
+    """Place a limit sell order."""
+    order = equity_sell_limit(symbol, shares, current_price)
+    print(f"[order] Placing limit SELL for {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})...")
     resp = client.place_order(account_hash, order)
     resp.raise_for_status()
     print(f"[order] Order placed successfully. Status: {resp.status_code}")
     return True
 
 
-def place_buy_order(client, account_hash, symbol, dollar_amount, current_price):
-    """Place a market buy order for the given dollar amount of shares."""
-    shares = math.floor(dollar_amount / current_price)
-    if shares < 1:
-        print(f"[order] Price ${current_price:.2f} too high to buy even 1 share with ${dollar_amount:.2f}.")
-        return False
-
-    order = equity_buy_market(symbol, shares)
-    print(f"[order] Placing market BUY for {shares} shares of {symbol} (~${shares * current_price:.2f})...")
+def place_buy_order(client, account_hash, symbol, shares, current_price):
+    """Place a limit buy order."""
+    order = equity_buy_limit(symbol, shares, current_price)
+    print(f"[order] Placing limit BUY for {shares} shares of {symbol} @ ${current_price:.2f} (~${shares * current_price:.2f})...")
     resp = client.place_order(account_hash, order)
     resp.raise_for_status()
     print(f"[order] Order placed successfully. Status: {resp.status_code}")
@@ -242,6 +245,11 @@ def check_buy(client, account_hash, last, pct_change):
     """Evaluate buy conditions and place order if met."""
     print(f"  Down {pct_change:+.2%} — meets {DIP_THRESHOLD:.0%} buy threshold!")
 
+    shares = math.floor(BUY_AMOUNT / last)
+    if shares < 1:
+        print(f"  Price ${last:.2f} too high to buy even 1 share with ${BUY_AMOUNT:.2f}. Skipping.")
+        return
+
     if has_orders_today(client, account_hash, SYMBOL, "BUY"):
         print("  Already have a buy order today. Skipping.")
         return
@@ -254,19 +262,25 @@ def check_buy(client, account_hash, last, pct_change):
         print(f"  Weekly buy limit would be exceeded. Skipping.")
         return
 
-    cash = get_cash_balance(client, account_hash)
+    account_data = get_account_data(client, account_hash)
+    cash = get_cash_balance(account_data)
     print(f"  Cash available: ${cash:.2f}")
 
     if cash < MIN_CASH:
         print(f"  Insufficient cash (need ${MIN_CASH:.2f}). Skipping.")
         return
 
-    place_buy_order(client, account_hash, SYMBOL, BUY_AMOUNT, last)
+    place_buy_order(client, account_hash, SYMBOL, shares, last)
 
 
 def check_sell(client, account_hash, last, pct_change):
     """Evaluate sell conditions and place order if met."""
     print(f"  Up {pct_change:+.2%} — meets +{SURGE_THRESHOLD:.0%} sell threshold!")
+
+    shares_wanted = math.floor(SELL_AMOUNT / last)
+    if shares_wanted < 1:
+        print(f"  Price ${last:.2f} too high to sell even 1 share for ${SELL_AMOUNT:.2f}. Skipping.")
+        return
 
     if has_orders_today(client, account_hash, SYMBOL, "SELL"):
         print("  Already have a sell order today. Skipping.")
@@ -279,7 +293,16 @@ def check_sell(client, account_hash, last, pct_change):
         print(f"  Weekly sell limit reached. Skipping.")
         return
 
-    place_sell_order(client, account_hash, SYMBOL, SELL_AMOUNT, last)
+    account_data = get_account_data(client, account_hash)
+    shares_held = get_shares_held(account_data, SYMBOL)
+    shares_to_sell = min(shares_wanted, int(shares_held))
+    print(f"  Shares held: {int(shares_held)}  Want to sell: {shares_wanted}  Will sell: {shares_to_sell}")
+
+    if shares_to_sell < 1:
+        print(f"  No {SYMBOL} shares to sell. Skipping.")
+        return
+
+    place_sell_order(client, account_hash, SYMBOL, shares_to_sell, last)
 
 
 def main():
