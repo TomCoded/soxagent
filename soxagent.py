@@ -316,9 +316,10 @@ def check_sell(client, account_hash, last, pct_change, dry_run=False):
     place_sell_order(client, account_hash, SYMBOL, shares_to_sell, last, dry_run)
 
 
-def simulate(candles, verbose=False):
-    """Run strategy simulation on a list of candles. Returns (total_return, cagr, num_buys, num_sells, start_date, end_date)."""
-    cash = MIN_CASH
+def simulate(candles, verbose=False, all_in=False):
+    """Run strategy simulation on a list of candles."""
+    initial_cash = 2500.0 if all_in else MIN_CASH
+    cash = initial_cash
     shares = 0
     num_buys = 0
     num_sells = 0
@@ -341,10 +342,13 @@ def simulate(candles, verbose=False):
         pct_low = (low - open_price) / open_price if open_price else 0.0
         if pct_low <= DIP_THRESHOLD:
             buy_price = open_price * (1 + DIP_THRESHOLD)
-            buy_shares = math.floor(BUY_AMOUNT / buy_price)
-            if (buy_shares >= 1
-                    and cash >= MIN_CASH
-                    and weekly_buy_spend + BUY_AMOUNT <= WEEKLY_BUY_LIMIT):
+            if all_in:
+                buy_shares = math.floor(cash / buy_price)
+            else:
+                buy_shares = math.floor(BUY_AMOUNT / buy_price)
+            can_buy = all_in or (cash >= MIN_CASH
+                                 and weekly_buy_spend + BUY_AMOUNT <= WEEKLY_BUY_LIMIT)
+            if buy_shares >= 1 and can_buy:
                 cost = buy_shares * buy_price
                 cash -= cost
                 shares += buy_shares
@@ -357,8 +361,12 @@ def simulate(candles, verbose=False):
         pct_high = (high - open_price) / open_price if open_price else 0.0
         if pct_high >= SURGE_THRESHOLD and shares > 0:
             sell_price = open_price * (1 + SURGE_THRESHOLD)
-            sell_shares = min(math.floor(SELL_AMOUNT / sell_price), shares)
-            if sell_shares >= 1 and weekly_sell_count < WEEKLY_SELL_LIMIT:
+            if all_in:
+                sell_shares = shares
+            else:
+                sell_shares = min(math.floor(SELL_AMOUNT / sell_price), shares)
+            can_sell = all_in or weekly_sell_count < WEEKLY_SELL_LIMIT
+            if sell_shares >= 1 and can_sell:
                 proceeds = sell_shares * sell_price
                 cash += proceeds
                 shares -= sell_shares
@@ -370,13 +378,13 @@ def simulate(candles, verbose=False):
 
     final_price = candles[-1]["close"]
     portfolio_value = cash + shares * final_price
-    total_return = (portfolio_value - MIN_CASH) / MIN_CASH
+    total_return = (portfolio_value - initial_cash) / initial_cash
 
     start_date = datetime.fromtimestamp(candles[0]["datetime"] / 1000).date()
     end_date = datetime.fromtimestamp(candles[-1]["datetime"] / 1000).date()
     years = (end_date - start_date).days / 365.25
     if years > 0 and portfolio_value > 0:
-        cagr = (portfolio_value / MIN_CASH) ** (1 / years) - 1
+        cagr = (portfolio_value / initial_cash) ** (1 / years) - 1
     else:
         cagr = 0.0
 
@@ -384,6 +392,7 @@ def simulate(candles, verbose=False):
         "total_return": total_return,
         "cagr": cagr,
         "portfolio_value": portfolio_value,
+        "initial_cash": initial_cash,
         "cash": cash,
         "shares": shares,
         "final_price": final_price,
@@ -394,8 +403,10 @@ def simulate(candles, verbose=False):
     }
 
 
-def backtest(client, days, samples=None):
+def backtest(client, days, samples=None, all_in=False):
     """Run strategy against historical daily OHLC data."""
+    if all_in:
+        print(f"[backtest] ALL-IN mode: starting with $2500, no weekly limits.")
     # Fetch enough data to cover all samples
     fetch_days = days * 2 if samples else days
     end = datetime.now()
@@ -425,7 +436,7 @@ def backtest(client, days, samples=None):
         results = []
         for idx in start_indices:
             candle_slice = all_candles[idx:idx + trading_days_needed]
-            result = simulate(candle_slice)
+            result = simulate(candle_slice, all_in=all_in)
             results.append(result)
             print(f"  {result['start_date']} — {result['end_date']}  "
                   f"return: {result['total_return']:+.2%}  "
@@ -448,10 +459,11 @@ def backtest(client, days, samples=None):
 
     else:
         candles = all_candles
-        print(f"[backtest] Starting with ${MIN_CASH:.2f} cash, 0 shares.")
+        starting_cash = 2500.0 if all_in else MIN_CASH
+        print(f"[backtest] Starting with ${starting_cash:.2f} cash, 0 shares.")
         print(f"[backtest] Simulating {len(candles)} trading days...\n")
 
-        result = simulate(candles, verbose=True)
+        result = simulate(candles, verbose=True, all_in=all_in)
 
         print(f"\n{'=' * 60}")
         print(f"  Backtest Results: {result['start_date']} — {result['end_date']}")
@@ -477,6 +489,8 @@ def main():
                         help="Backtest strategy against N days of historical data")
     parser.add_argument("--backtest-samples", type=int, metavar="N", default=None,
                         help="Run N random-start-date samples (use with --backtest)")
+    parser.add_argument("--all-in", action="store_true",
+                        help="Backtest with $2500 start, no weekly limits, buy/sell all on triggers")
     args = parser.parse_args()
 
     load_env()
@@ -488,7 +502,7 @@ def main():
         return
 
     if args.backtest:
-        backtest(client, args.backtest, samples=args.backtest_samples)
+        backtest(client, args.backtest, samples=args.backtest_samples, all_in=args.all_in)
         return
 
     account_hash = get_account_hash(client)
