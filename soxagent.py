@@ -12,6 +12,7 @@ import fcntl
 import json
 import math
 import os
+import random
 import sys
 import time
 from datetime import datetime, date, timedelta
@@ -315,28 +316,15 @@ def check_sell(client, account_hash, last, pct_change, dry_run=False):
     place_sell_order(client, account_hash, SYMBOL, shares_to_sell, last, dry_run)
 
 
-def backtest(client, days):
-    """Run strategy against historical daily OHLC data."""
-    end = datetime.now()
-    start = end - timedelta(days=days)
-
-    print(f"[backtest] Fetching {SYMBOL} price history for {days} days...")
-    resp = client.get_price_history_every_day(SYMBOL, start_datetime=start, end_datetime=end)
-    resp.raise_for_status()
-    candles = resp.json().get("candles", [])
-    if not candles:
-        print("[backtest] No historical data returned.")
-        return
-
+def simulate(candles, verbose=False):
+    """Run strategy simulation on a list of candles. Returns (total_return, cagr, num_buys, num_sells, start_date, end_date)."""
     cash = MIN_CASH
     shares = 0
-    trades = []
+    num_buys = 0
+    num_sells = 0
     weekly_buy_spend = 0.0
     weekly_sell_count = 0
     last_week_num = None
-
-    print(f"[backtest] Starting with ${cash:.2f} cash, 0 shares.")
-    print(f"[backtest] Simulating {len(candles)} trading days...\n")
 
     for candle in candles:
         dt = datetime.fromtimestamp(candle["datetime"] / 1000)
@@ -344,17 +332,15 @@ def backtest(client, days):
         low = candle["low"]
         high = candle["high"]
 
-        # Reset weekly counters each new week
         week_num = dt.isocalendar()[1]
         if last_week_num is not None and week_num != last_week_num:
             weekly_buy_spend = 0.0
             weekly_sell_count = 0
         last_week_num = week_num
 
-        # Check for buy: use low as worst-case intraday price
         pct_low = (low - open_price) / open_price if open_price else 0.0
         if pct_low <= DIP_THRESHOLD:
-            buy_price = open_price * (1 + DIP_THRESHOLD)  # approximate trigger price
+            buy_price = open_price * (1 + DIP_THRESHOLD)
             buy_shares = math.floor(BUY_AMOUNT / buy_price)
             if (buy_shares >= 1
                     and cash >= MIN_CASH
@@ -363,44 +349,120 @@ def backtest(client, days):
                 cash -= cost
                 shares += buy_shares
                 weekly_buy_spend += cost
-                trades.append((dt.date(), "BUY", buy_shares, buy_price, cash, shares))
-                print(f"  {dt.date()}  BUY  {buy_shares} @ ${buy_price:.2f}  "
-                      f"cash=${cash:.2f}  shares={shares}")
+                num_buys += 1
+                if verbose:
+                    print(f"  {dt.date()}  BUY  {buy_shares} @ ${buy_price:.2f}  "
+                          f"cash=${cash:.2f}  shares={shares}")
 
-        # Check for sell: use high as best-case intraday price
         pct_high = (high - open_price) / open_price if open_price else 0.0
         if pct_high >= SURGE_THRESHOLD and shares > 0:
-            sell_price = open_price * (1 + SURGE_THRESHOLD)  # approximate trigger price
+            sell_price = open_price * (1 + SURGE_THRESHOLD)
             sell_shares = min(math.floor(SELL_AMOUNT / sell_price), shares)
             if sell_shares >= 1 and weekly_sell_count < WEEKLY_SELL_LIMIT:
                 proceeds = sell_shares * sell_price
                 cash += proceeds
                 shares -= sell_shares
                 weekly_sell_count += 1
-                trades.append((dt.date(), "SELL", sell_shares, sell_price, cash, shares))
-                print(f"  {dt.date()}  SELL {sell_shares} @ ${sell_price:.2f}  "
-                      f"cash=${cash:.2f}  shares={shares}")
+                num_sells += 1
+                if verbose:
+                    print(f"  {dt.date()}  SELL {sell_shares} @ ${sell_price:.2f}  "
+                          f"cash=${cash:.2f}  shares={shares}")
 
-    # Final summary
     final_price = candles[-1]["close"]
     portfolio_value = cash + shares * final_price
-    initial_value = MIN_CASH
-    total_return = (portfolio_value - initial_value) / initial_value
+    total_return = (portfolio_value - MIN_CASH) / MIN_CASH
 
-    buys = [t for t in trades if t[1] == "BUY"]
-    sells = [t for t in trades if t[1] == "SELL"]
-
-    print(f"\n{'=' * 60}")
     start_date = datetime.fromtimestamp(candles[0]["datetime"] / 1000).date()
     end_date = datetime.fromtimestamp(candles[-1]["datetime"] / 1000).date()
-    print(f"  Backtest Results: {start_date} — {end_date}")
-    print(f"  {SYMBOL} final close: ${final_price:.2f}")
-    print(f"  Trades: {len(buys)} buys, {len(sells)} sells")
-    print(f"  Final cash:   ${cash:.2f}")
-    print(f"  Final shares: {shares} (worth ${shares * final_price:.2f})")
-    print(f"  Portfolio:    ${portfolio_value:.2f}")
-    print(f"  Total return: {total_return:+.2%}")
-    print(f"{'=' * 60}")
+    years = (end_date - start_date).days / 365.25
+    if years > 0 and portfolio_value > 0:
+        cagr = (portfolio_value / MIN_CASH) ** (1 / years) - 1
+    else:
+        cagr = 0.0
+
+    return {
+        "total_return": total_return,
+        "cagr": cagr,
+        "portfolio_value": portfolio_value,
+        "cash": cash,
+        "shares": shares,
+        "final_price": final_price,
+        "num_buys": num_buys,
+        "num_sells": num_sells,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+
+def backtest(client, days, samples=None):
+    """Run strategy against historical daily OHLC data."""
+    # Fetch enough data to cover all samples
+    fetch_days = days * 2 if samples else days
+    end = datetime.now()
+    start = end - timedelta(days=fetch_days)
+
+    print(f"[backtest] Fetching {SYMBOL} price history...")
+    resp = client.get_price_history_every_day(SYMBOL, start_datetime=start, end_datetime=end)
+    resp.raise_for_status()
+    all_candles = resp.json().get("candles", [])
+    if not all_candles:
+        print("[backtest] No historical data returned.")
+        return
+
+    if samples:
+        # Need at least `days` worth of trading days for each sample
+        trading_days_needed = int(days * 252 / 365)  # approximate trading days
+        if len(all_candles) <= trading_days_needed:
+            print(f"[backtest] Not enough data for {days}-day samples. Have {len(all_candles)} trading days.")
+            return
+
+        max_start_idx = len(all_candles) - trading_days_needed
+        sample_count = min(samples, max_start_idx)
+        start_indices = sorted(random.sample(range(max_start_idx), sample_count))
+
+        print(f"[backtest] Running {sample_count} samples of ~{trading_days_needed} trading days each.\n")
+
+        results = []
+        for idx in start_indices:
+            candle_slice = all_candles[idx:idx + trading_days_needed]
+            result = simulate(candle_slice)
+            results.append(result)
+            print(f"  {result['start_date']} — {result['end_date']}  "
+                  f"return: {result['total_return']:+.2%}  "
+                  f"CAGR: {result['cagr']:+.2%}  "
+                  f"buys: {result['num_buys']}  sells: {result['num_sells']}  "
+                  f"portfolio: ${result['portfolio_value']:.2f}")
+
+        avg_return = sum(r["total_return"] for r in results) / len(results)
+        avg_cagr = sum(r["cagr"] for r in results) / len(results)
+        best = max(results, key=lambda r: r["total_return"])
+        worst = min(results, key=lambda r: r["total_return"])
+
+        print(f"\n{'=' * 60}")
+        print(f"  Monte Carlo Backtest: {sample_count} samples, ~{trading_days_needed} trading days each")
+        print(f"  Avg return:  {avg_return:+.2%}")
+        print(f"  Avg CAGR:    {avg_cagr:+.2%}")
+        print(f"  Best:        {best['total_return']:+.2%} ({best['start_date']} — {best['end_date']})")
+        print(f"  Worst:       {worst['total_return']:+.2%} ({worst['start_date']} — {worst['end_date']})")
+        print(f"{'=' * 60}")
+
+    else:
+        candles = all_candles
+        print(f"[backtest] Starting with ${MIN_CASH:.2f} cash, 0 shares.")
+        print(f"[backtest] Simulating {len(candles)} trading days...\n")
+
+        result = simulate(candles, verbose=True)
+
+        print(f"\n{'=' * 60}")
+        print(f"  Backtest Results: {result['start_date']} — {result['end_date']}")
+        print(f"  {SYMBOL} final close: ${result['final_price']:.2f}")
+        print(f"  Trades: {result['num_buys']} buys, {result['num_sells']} sells")
+        print(f"  Final cash:   ${result['cash']:.2f}")
+        print(f"  Final shares: {result['shares']} (worth ${result['shares'] * result['final_price']:.2f})")
+        print(f"  Portfolio:    ${result['portfolio_value']:.2f}")
+        print(f"  Total return: {result['total_return']:+.2%}")
+        print(f"  CAGR:         {result['cagr']:+.2%}")
+        print(f"{'=' * 60}")
 
 
 def main():
@@ -413,6 +475,8 @@ def main():
                         help="Run checks against live data but do not place orders")
     parser.add_argument("--backtest", type=int, metavar="DAYS",
                         help="Backtest strategy against N days of historical data")
+    parser.add_argument("--backtest-samples", type=int, metavar="N", default=None,
+                        help="Run N random-start-date samples (use with --backtest)")
     args = parser.parse_args()
 
     load_env()
@@ -424,7 +488,7 @@ def main():
         return
 
     if args.backtest:
-        backtest(client, args.backtest)
+        backtest(client, args.backtest, samples=args.backtest_samples)
         return
 
     account_hash = get_account_hash(client)
